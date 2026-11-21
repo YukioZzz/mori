@@ -699,3 +699,9 @@ endif()
 target_link_libraries(test_umbp_sim PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB}
                                            ${_TEST_GRPCPP_LIB} GTest::gtest_main)
 add_test(NAME umbp_sim COMMAND test_umbp_sim)
+add_executable(test_standalone_fd_protocol test_standalone_fd_protocol.cpp
+               ${CMAKE_SOURCE_DIR}/src/umbp/standalone/ipc.cpp)
+target_include_directories(test_standalone_fd_protocol PRIVATE
+                           ${CMAKE_SOURCE_DIR}/src/umbp/include)
+target_link_libraries(test_standalone_fd_protocol PRIVATE gtest_main)
+add_test(NAME standalone_fd_protocol COMMAND test_standalone_fd_protocol)

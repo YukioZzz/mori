@@ -57,6 +57,7 @@
 #include <utility>
 #include <vector>
 
+#include "mori/utils/hip_compat.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_copy.h"
 #include "umbp/common/grpc_limits.h"
@@ -480,8 +481,10 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
         server.RegisterGpuIpc(request, response);
       else if (request.kind() == ::umbp::MEMORY_KIND_HOST_SHM)
         server.ConfirmHostRegistration(request, response);
+      else if (request.kind() == ::umbp::MEMORY_KIND_GPU_DMABUF)
+        server.ConfirmGpuDmaBufRegistration(request, response);
       else
-        SetBool(response, false, "real server requires HOST_SHM or GPU_IPC memory");
+        SetBool(response, false, "real server requires HOST_SHM, GPU_IPC or GPU_DMABUF memory");
     }
     bool RegisterFd(Impl& server, int fd, const FdRegistrationMessage& msg) override {
       return server.RegisterRealFd(fd, msg);
@@ -1093,7 +1096,31 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   }
 
  private:
-  enum class MemoryKind { kHostShm, kGpuIpc, kVirtual };
+  enum class MemoryKind { kHostShm, kGpuIpc, kVirtual, kGpuDmaBuf };
+
+  struct GpuDmaBufMapping {
+    void* base = nullptr;
+    size_t size = 0;
+    int device = -1;
+    int fd = -1;
+    int import_fd = -1;
+    hipMemGenericAllocationHandle_t handle{};
+    bool mapped = false;
+
+    ~GpuDmaBufMapping() {
+      ScopedHipDevice device_guard(device);
+      if (mapped) (void)hipMemUnmap(base, size);
+      if (base) (void)hipMemAddressFree(base, size);
+      if (handle) (void)hipMemRelease(handle);
+      // Some HIP versions consume the import FD. Do not close a reused number.
+      struct stat original{}, imported{};
+      if (import_fd >= 0 && fstat(fd, &original) == 0 && fstat(import_fd, &imported) == 0 &&
+          original.st_dev == imported.st_dev && original.st_ino == imported.st_ino) {
+        close(import_fd);
+      }
+      if (fd >= 0) close(fd);
+    }
+  };
 
   struct RegisteredMemory {
     void* base = nullptr;
@@ -1103,6 +1130,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     int device_id = -1;
     uint64_t alloc_base = 0;
     std::string client_id;
+    std::shared_ptr<GpuDmaBufMapping> gpu_dmabuf;
   };
 
   struct RangeQuery {
@@ -1323,6 +1351,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   }
 
   bool RegisterRealFd(int fd, const FdRegistrationMessage& msg) {
+    if (msg.version == kGpuFdRegistrationVersion) return RegisterGpuDmaBuf(fd, msg);
     void* mapped =
         mmap(nullptr, static_cast<size_t>(msg.size), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
@@ -1351,6 +1380,94 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     MORI_UMBP_INFO("[StandaloneServer] registered shm client_id={} worker_base=0x{:x} size={}MB",
                    client_id, msg.worker_base, msg.size / (1024 * 1024));
     return true;
+  }
+
+  bool RegisterGpuDmaBuf(int fd, const FdRegistrationMessage& msg) {
+    std::lock_guard<std::mutex> lifecycle_lock(external_identity_lifecycle_mu_);
+    auto mapping = std::make_shared<GpuDmaBufMapping>();
+    mapping->fd = fd;
+    mapping->device = msg.device_id;
+    mapping->size = msg.size;
+    if (!BackendIsDistributed() || BackendMedium(backend_config_) == UMBPMedium::SSD ||
+        msg.size > std::numeric_limits<size_t>::max() ||
+        msg.size > std::numeric_limits<uintptr_t>::max() - msg.worker_base)
+      return false;
+    struct stat backing{};
+    if (fstat(fd, &backing) != 0 || backing.st_size <= 0 ||
+        msg.size > static_cast<uint64_t>(backing.st_size))
+      return false;
+    {
+      std::shared_lock<std::shared_mutex> lock(memory_mu_);
+      auto it = memory_.find(msg.client_id);
+      if (it != memory_.end()) {
+        for (const auto& entry : it->second) {
+          if (entry.worker_base != msg.worker_base) continue;
+          struct stat existing{};
+          // Do not replace a live allocation if the same worker address was
+          // reused without deregistration; pending I/O may still reference it.
+          return entry.gpu_dmabuf && entry.size == msg.size && entry.device_id == msg.device_id &&
+                 fstat(entry.gpu_dmabuf->fd, &existing) == 0 && existing.st_dev == backing.st_dev &&
+                 existing.st_ino == backing.st_ino;
+        }
+      }
+    }
+    ScopedHipDevice device_guard(msg.device_id);
+    if (!device_guard.IsValid()) return false;
+    mapping->import_fd = dup(fd);
+    if (mapping->import_fd < 0) return false;
+    hipError_t status = hipMemImportFromShareableHandleCompat(&mapping->handle, mapping->import_fd,
+                                                              hipMemHandleTypePosixFileDescriptor);
+    if (status == hipSuccess) {
+      status = hipMemAddressReserve(&mapping->base, mapping->size, 0, nullptr, 0);
+    }
+    if (status == hipSuccess) {
+      status = hipMemMap(mapping->base, mapping->size, 0, mapping->handle, 0);
+      mapping->mapped = status == hipSuccess;
+    }
+    if (status == hipSuccess) {
+      hipMemAccessDesc access{};
+      access.location.type = hipMemLocationTypeDevice;
+      access.location.id = msg.device_id;
+      access.flags = hipMemAccessFlagsProtReadWrite;
+      status = hipMemSetAccess(mapping->base, mapping->size, &access, 1);
+    }
+    if (status != hipSuccess) {
+      MORI_UMBP_ERROR("[StandaloneServer] GPU dma-buf import failed: {}",
+                      hipGetErrorString(status));
+      (void)hipGetLastError();
+      return false;
+    }
+    if (!RegisterBackendMemory(mapping->base, mapping->size, mori::io::MemoryLocationType::GPU,
+                               msg.device_id, MemoryRegistration::kLocalCopyOnly))
+      return false;
+    RegisteredMemory entry;
+    entry.base = mapping->base;
+    entry.worker_base = msg.worker_base;
+    entry.size = msg.size;
+    entry.kind = MemoryKind::kGpuDmaBuf;
+    entry.device_id = msg.device_id;
+    entry.client_id = msg.client_id;
+    entry.gpu_dmabuf = std::move(mapping);
+    auto old = InsertOrReplaceRegion(entry.client_id, entry);
+    if (old) ReleaseRegisteredMemory(*old);
+    MORI_UMBP_INFO(
+        "[StandaloneServer] registered GPU dma-buf client_id={} worker_base=0x{:x} "
+        "size={}MB device={}",
+        entry.client_id, entry.worker_base, entry.size / (1024 * 1024), entry.device_id);
+    return true;
+  }
+
+  void ConfirmGpuDmaBufRegistration(const ::umbp::RegisterMemoryRequest& request,
+                                    ::umbp::BoolResponse* response) {
+    std::shared_lock<std::shared_mutex> lock(memory_mu_);
+    auto it = memory_.find(request.client_id());
+    bool ok = it != memory_.end() &&
+              std::any_of(it->second.begin(), it->second.end(), [&](const RegisteredMemory& entry) {
+                return entry.kind == MemoryKind::kGpuDmaBuf &&
+                       entry.worker_base == request.worker_base() && entry.size == request.size() &&
+                       entry.device_id == request.device_id();
+              });
+    SetBool(response, ok, ok ? "" : "GPU dma-buf FD handoff is missing or mismatched");
   }
 
   bool HasIdenticalGpuRegion(const ::umbp::RegisterMemoryRequest& request) {
@@ -1612,7 +1729,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     }
     if (mem.kind == MemoryKind::kGpuIpc) {
       ReleaseIpcMapping(IpcKey{mem.client_id, mem.device_id, mem.alloc_base});
-    } else {
+    } else if (mem.kind != MemoryKind::kGpuDmaBuf) {
       munmap(mem.base, static_cast<size_t>(mem.size));
     }
   }

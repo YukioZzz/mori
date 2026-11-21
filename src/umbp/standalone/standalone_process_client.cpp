@@ -41,6 +41,7 @@
 #include <stdexcept>
 #include <thread>
 
+#include "mori/application/memory/hip_gem_allocator.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_copy.h"
 #include "umbp/common/grpc_limits.h"
@@ -424,6 +425,7 @@ bool StandaloneProcessClient::OffsetFor(uintptr_t ptr, size_t size, uint64_t* of
 bool StandaloneProcessClient::OffsetForLocked(uintptr_t ptr, size_t size, uint64_t* offset,
                                               uint64_t* region_base) const {
   for (const auto& region : regions_) {
+    if (!region.confirmed) continue;
     if (ptr < region.base) continue;
     uintptr_t rel = ptr - region.base;
     if (rel > region.size || size > region.size - rel) continue;
@@ -927,6 +929,9 @@ bool StandaloneProcessClient::RegisterMemory(uintptr_t ptr, size_t size,
 
 bool StandaloneProcessClient::RegisterDeviceMemory(uintptr_t ptr, size_t size, int device_id) {
   if (ptr == 0 || size == 0) return false;
+  if (mori::application::HipGemLookup(reinterpret_cast<void*>(ptr), nullptr, false)) {
+    return RegisterGpuDmaBufMemory(ptr, size, device_id);
+  }
   ScopedHipDevice device_guard(device_id);
   if (!device_guard.IsValid()) {
     MORI_UMBP_ERROR("[StandaloneProcessClient] failed to select GPU device {}", device_id);
@@ -995,6 +1000,76 @@ bool StandaloneProcessClient::RegisterDeviceMemory(uintptr_t ptr, size_t size, i
     existing->size = size;
   } else {
     regions_.push_back({ptr, size, RegionKind::kGpuIpc});
+  }
+  return true;
+}
+
+bool StandaloneProcessClient::RegisterGpuDmaBufMemory(uintptr_t ptr, size_t size, int device_id) {
+  mori::application::HipGemBuffer allocation;
+  if (!mori::application::HipGemLookup(reinterpret_cast<void*>(ptr), &allocation, true))
+    return false;
+  const uintptr_t base = reinterpret_cast<uintptr_t>(allocation.base);
+  if (allocation.device != device_id || ptr < base || ptr - base > allocation.size ||
+      size > allocation.size - (ptr - base)) {
+    close(allocation.dmabufFd);
+    return false;
+  }
+  // Like host SHM, register the allocation once and resolve layer views as offsets.
+  bool handed_off = false;
+  {
+    std::lock_guard<std::mutex> lock(registration_mu_);
+    for (const auto& region : regions_) {
+      if (region.base == base && region.kind == RegionKind::kGpuDmaBuf &&
+          region.size == allocation.size) {
+        if (region.confirmed) {
+          close(allocation.dmabufFd);
+          return true;
+        }
+        handed_off = true;
+        break;
+      }
+    }
+  }
+  const std::string client_id = ClientId();
+  std::string error;
+  const int status =
+      handed_off ? 0
+                 : SendFdRegistration(fd_socket_path_, allocation.dmabufFd, client_id, base,
+                                      allocation.size, standalone_config_.startup_timeout_ms,
+                                      &error, device_id);
+  close(allocation.dmabufFd);
+  if (status != 0) {
+    MORI_UMBP_ERROR("[StandaloneProcessClient] GPU dma-buf handoff failed: {}", error);
+    return false;
+  }
+  ::umbp::RegisterMemoryRequest req;
+  req.set_client_id(client_id);
+  req.set_worker_base(base);
+  req.set_size(allocation.size);
+  req.set_kind(::umbp::MEMORY_KIND_GPU_DMABUF);
+  req.set_device_id(device_id);
+  req.set_worker_node_id(standalone_config_.worker_node_id);
+  req.set_worker_node_address(standalone_config_.worker_node_address);
+  for (const auto& tag : standalone_config_.tags) req.add_tags(tag);
+  // Retain successful FD handoffs even if RPC confirmation fails, so Close can
+  // deregister the server mapping instead of leaking it on a partial failure.
+  {
+    std::lock_guard<std::mutex> lock(registration_mu_);
+    if (!handed_off) regions_.push_back({base, allocation.size, RegionKind::kGpuDmaBuf, false});
+  }
+  grpc::ClientContext ctx;
+  ::umbp::BoolResponse resp;
+  const grpc::Status rpc_status = stub_->RegisterMemory(&ctx, req, &resp);
+  if (!rpc_status.ok() || !resp.ok()) {
+    MORI_UMBP_ERROR("[StandaloneProcessClient] GPU dma-buf confirmation failed: {}",
+                    rpc_status.ok() ? resp.error() : rpc_status.error_message());
+    return false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(registration_mu_);
+    for (auto& region : regions_) {
+      if (region.base == base && region.kind == RegionKind::kGpuDmaBuf) region.confirmed = true;
+    }
   }
   return true;
 }

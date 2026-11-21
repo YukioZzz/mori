@@ -161,7 +161,8 @@ bool EnsureParentDirectory(const std::string& path, std::string* error) {
 }
 
 int SendFdRegistration(const std::string& socket_path, int fd, const std::string& client_id,
-                       uintptr_t worker_base, size_t size, int timeout_ms, std::string* error) {
+                       uintptr_t worker_base, size_t size, int timeout_ms, std::string* error,
+                       int device_id) {
   if (client_id.empty() || client_id.size() >= kClientIdBytes) {
     SetError(error, "client_id is empty or too long");
     return -1;
@@ -193,12 +194,17 @@ int SendFdRegistration(const std::string& socket_path, int fd, const std::string
   std::strncpy(msg.client_id, client_id.c_str(), sizeof(msg.client_id) - 1);
   msg.worker_base = static_cast<uint64_t>(worker_base);
   msg.size = static_cast<uint64_t>(size);
+  if (device_id >= 0) {
+    msg.version = kGpuFdRegistrationVersion;
+    msg.device_id = device_id;
+  }
+  const size_t wire_size = device_id >= 0 ? sizeof(msg) : kFdRegistrationV1Bytes;
 
   msghdr hdr;
   std::memset(&hdr, 0, sizeof(hdr));
   iovec iov;
   iov.iov_base = &msg;
-  iov.iov_len = sizeof(msg);
+  iov.iov_len = wire_size;
   hdr.msg_iov = &iov;
   hdr.msg_iovlen = 1;
 
@@ -213,9 +219,9 @@ int SendFdRegistration(const std::string& socket_path, int fd, const std::string
   std::memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
 
   while (true) {
-    ssize_t sent = sendmsg(sock, &hdr, 0);
+    ssize_t sent = sendmsg(sock, &hdr, MSG_NOSIGNAL);
     if (sent < 0 && errno == EINTR) continue;
-    if (sent != static_cast<ssize_t>(sizeof(msg))) {
+    if (sent != static_cast<ssize_t>(wire_size)) {
       SetError(error, sent < 0 ? ErrnoMessage("sendmsg") : "short sendmsg");
       close(sock);
       return -1;
@@ -234,11 +240,12 @@ int SendFdRegistration(const std::string& socket_path, int fd, const std::string
 
 int RecvFdRegistration(int socket_fd, FdRegistrationMessage* message, std::string* error) {
   if (!message) return -1;
+  *message = FdRegistrationMessage{};
   msghdr hdr;
   std::memset(&hdr, 0, sizeof(hdr));
   iovec iov;
   iov.iov_base = message;
-  iov.iov_len = sizeof(*message);
+  iov.iov_len = kFdRegistrationV1Bytes;
   hdr.msg_iov = &iov;
   hdr.msg_iovlen = 1;
 
@@ -249,19 +256,25 @@ int RecvFdRegistration(int socket_fd, FdRegistrationMessage* message, std::strin
 
   ssize_t received = 0;
   while (true) {
-    received = recvmsg(socket_fd, &hdr, 0);
+    received = recvmsg(socket_fd, &hdr, MSG_WAITALL | MSG_CMSG_CLOEXEC);
     if (received < 0 && errno == EINTR) continue;
     break;
   }
   auto close_delivered_fd = [&]() {
-    cmsghdr* delivered = CMSG_FIRSTHDR(&hdr);
-    if (delivered && delivered->cmsg_level == SOL_SOCKET && delivered->cmsg_type == SCM_RIGHTS) {
-      int delivered_fd = -1;
-      std::memcpy(&delivered_fd, CMSG_DATA(delivered), sizeof(int));
-      if (delivered_fd >= 0) close(delivered_fd);
+    for (cmsghdr* delivered = CMSG_FIRSTHDR(&hdr); delivered;
+         delivered = CMSG_NXTHDR(&hdr, delivered)) {
+      if (delivered->cmsg_level != SOL_SOCKET || delivered->cmsg_type != SCM_RIGHTS ||
+          delivered->cmsg_len < CMSG_LEN(0))
+        continue;
+      const size_t count = (delivered->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+      for (size_t i = 0; i < count; ++i) {
+        int delivered_fd = -1;
+        std::memcpy(&delivered_fd, CMSG_DATA(delivered) + i * sizeof(int), sizeof(int));
+        if (delivered_fd >= 0) close(delivered_fd);
+      }
     }
   };
-  if (received != static_cast<ssize_t>(sizeof(*message)) ||
+  if (received != static_cast<ssize_t>(kFdRegistrationV1Bytes) ||
       (hdr.msg_flags & (MSG_TRUNC | MSG_CTRUNC))) {
     close_delivered_fd();
     SetError(error, received < 0 ? ErrnoMessage("recvmsg") : "malformed fd registration message");
@@ -269,18 +282,31 @@ int RecvFdRegistration(int socket_fd, FdRegistrationMessage* message, std::strin
   }
 
   cmsghdr* cmsg = CMSG_FIRSTHDR(&hdr);
-  if (!cmsg || cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
+  if (!cmsg || cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS ||
+      cmsg->cmsg_len != CMSG_LEN(sizeof(int))) {
     close_delivered_fd();
     SetError(error, "fd registration message missing SCM_RIGHTS fd");
     return -1;
   }
   int received_fd = -1;
   std::memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(int));
-  if (message->magic != kFdRegistrationMagic || message->version != kFdRegistrationVersion ||
-      message->client_id[kClientIdBytes - 1] != '\0' || message->size == 0) {
+  if (message->magic != kFdRegistrationMagic ||
+      (message->version != kFdRegistrationVersion &&
+       message->version != kGpuFdRegistrationVersion) ||
+      message->client_id[0] == '\0' || message->client_id[kClientIdBytes - 1] != '\0' ||
+      message->size == 0 || message->worker_base == 0) {
     close(received_fd);
     SetError(error, "invalid fd registration payload");
     return -1;
+  }
+  if (message->version == kGpuFdRegistrationVersion) {
+    auto* extension = reinterpret_cast<char*>(message) + kFdRegistrationV1Bytes;
+    if (!RecvAll(socket_fd, extension, sizeof(*message) - kFdRegistrationV1Bytes, error) ||
+        message->device_id < 0 || message->reserved != 0) {
+      close(received_fd);
+      SetError(error, "invalid GPU fd registration extension");
+      return -1;
+    }
   }
   return received_fd;
 }

@@ -169,6 +169,7 @@ enum MemoryKind {
   MEMORY_KIND_HOST_SHM = 0;
   MEMORY_KIND_GPU_IPC = 1;
   MEMORY_KIND_VIRTUAL = 2;
+  MEMORY_KIND_GPU_DMABUF = 3;
 }
 
 message RegisterMemoryRequest {

@@ -119,6 +119,7 @@ class StandaloneProcessClient : public IUMBPClient {
   std::string ClientId();
   void DeregisterMemoryLocked();
   bool RegisterDeviceMemory(uintptr_t ptr, size_t size, int device_id);
+  bool RegisterGpuDmaBufMemory(uintptr_t ptr, size_t size, int device_id);
   bool RegisterHostShmMemory(uintptr_t ptr, size_t size);
 
   class MemoryExporter;
@@ -140,7 +141,7 @@ class StandaloneProcessClient : public IUMBPClient {
   UMBPDeploymentMode backend_mode_ = UMBPDeploymentMode::StandaloneProcess;
   bool supports_ranged_io_ = false;
 
-  enum class RegionKind { kHostShm, kGpuIpc, kVirtual };
+  enum class RegionKind { kHostShm, kGpuIpc, kVirtual, kGpuDmaBuf };
 
   // A hybrid worker can register several non-contiguous host or GPU regions.
   // `base` is the worker VA used as region_base in data requests.
@@ -148,6 +149,7 @@ class StandaloneProcessClient : public IUMBPClient {
     uintptr_t base = 0;
     size_t size = 0;
     RegionKind kind = RegionKind::kHostShm;
+    bool confirmed = true;
   };
 
   mutable std::mutex registration_mu_;
