@@ -3520,6 +3520,22 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
     return results;
   }
 
+  // Counts are stage events, not disjoint failed keys: one key may span units.
+  size_t local_transfer_failed_keys = 0;
+  size_t route_missing_keys = 0;
+  size_t remote_fetch_failed_units = 0;
+  size_t scatter_failed_units = 0;
+  ScopeExit failure_report{[&] {
+    if (local_transfer_failed_keys || route_missing_keys || remote_fetch_failed_units ||
+        scatter_failed_units) {
+      MORI_UMBP_WARN(
+          "[PoolClient] BatchGetRanges failed stages: keys={} local_transfer_keys={} "
+          "route_missing_keys={} remote_fetch_units={} scatter_units={}",
+          n, local_transfer_failed_keys, route_missing_keys, remote_fetch_failed_units,
+          scatter_failed_units);
+    }
+  }};
+
   // Observed at scope exit for whichever phases ran; see ScopedBatchBandwidth.
   double local_bytes = 0.0;
   double remote_bytes = 0.0;
@@ -3701,7 +3717,10 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
       }
       const std::unordered_set<size_t> failed(failed_tags.begin(), failed_tags.end());
       for (size_t i : local_keys) {
-        if (failed.count(i) != 0) continue;
+        if (failed.count(i) != 0) {
+          ++local_transfer_failed_keys;
+          continue;
+        }
         results[i] = true;
         record_local_get(i);
         if (dbg != nullptr) dbg->local_keys += 1;
@@ -3806,7 +3825,15 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
 
   for (size_t r = 0; r < missed.size(); ++r) {
     const size_t original = missed[r];
-    if (!routes[r].has_value()) continue;  // genuinely nowhere in the cluster
+    if (!routes[r].has_value()) {
+      ++route_missing_keys;
+      // Bound error-path samples; the summary retains the full failure count.
+      constexpr size_t kMaxMissingRouteSamples = 8;
+      if (route_missing_keys <= kMaxMissingRouteSamples) {
+        MORI_UMBP_WARN("[PoolClient] BatchGetRanges route missing: key='{}'", keys[original]);
+      }
+      continue;
+    }
     const auto& route = *routes[r];
     const size_t object_size = static_cast<size_t>(route.size);
     if (route.node_id == config_.master_config.node_id || route.size == 0 ||
@@ -4041,10 +4068,12 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
     for (size_t j = 0; j < count; ++j) {
       const auto& unit = units[pos + j];
       if (!fetched[j]) {
+        ++remote_fetch_failed_units;
         unit_ok[unit.original] = false;
         continue;
       }
       if (scattered.count(j) == 0 || scatter_failed.count(j) != 0) {
+        ++scatter_failed_units;
         unit_ok[unit.original] = false;
         continue;
       }
@@ -4940,14 +4969,32 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
   // omit_descs and sent none).
   if (!decoded.descs.empty()) peer_directory_->CacheRemoteBuffers(peer.node_id, decoded.descs);
 
+  size_t resolve_not_found = 0;
+  size_t resolve_permanent_failure = 0;
+  ScopeExit resolve_report{[&] {
+    if (resolve_not_found || resolve_permanent_failure) {
+      MORI_UMBP_WARN(
+          "[PoolClient] BatchGet resolve failures: peer={} keys={} not_found={} "
+          "permanent_failure={}",
+          peer.node_id, items.size(), resolve_not_found, resolve_permanent_failure);
+    }
+  }};
   entries->reserve(items.size());
   for (size_t i = 0; i < items.size(); ++i) {
     const auto& item = items[i];
     const auto& key = decoded.keys[i];
     if (!key.found) {
       if (key.outcome == ResolveOutcome::kFailed) {
+        ++resolve_permanent_failure;
         MORI_UMBP_ERROR("[PoolClient] BatchGet: peer reported permanent resolve failure key='{}'",
                         *item.key);
+      } else {
+        ++resolve_not_found;
+        constexpr size_t kMaxMissingPeerSamples = 8;
+        if (resolve_not_found <= kMaxMissingPeerSamples) {
+          MORI_UMBP_WARN("[PoolClient] BatchGet peer missing: peer={} key='{}'",
+                        peer.node_id, *item.key);
+        }
       }
       (*results)[item.index] = false;
       continue;
